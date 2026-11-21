@@ -1,0 +1,56 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+// Fixed signing key (optional). The keystore is never committed: CI decodes it
+// from the KEYSTORE_B64 secret into <repo>/ytdl.p12 and passes KEYSTORE_PASSWORD.
+def keystoreFile = rootProject.file('ytdl.p12')
+def keystorePass = (System.getenv('KEYSTORE_PASSWORD') ?: '').replaceAll(/[^0-9a-fA-F]/, '')
+def hasKeystore = keystoreFile.exists() && keystorePass.length() > 0
+
+android {
+    namespace 'com.tushar.ytdl'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.tushar.ytdl"
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    signingConfigs {
+        ytdl {
+            storeType 'pkcs12'
+            keyAlias 'ytdl'
+            storeFile keystoreFile
+            storePassword keystorePass
+            keyPassword keystorePass
+        }
+    }
+
+    buildTypes {
+        debug {
+            if (hasKeystore) {
+                signingConfig signingConfigs.ytdl
+            }
+        }
+        release {
+            minifyEnabled false
+            if (hasKeystore) {
+                signingConfig signingConfigs.ytdl
+            }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+}
