@@ -8,6 +8,10 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      HAS_KEYSTORE: ${{ secrets.KEYSTORE_B64 != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,14 +28,10 @@ jobs:
           gradle-version: '8.5'
 
       - name: Decode keystore
-        if: ${{ secrets.KEYSTORE_B64 != '' }}
-        env:
-          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+        if: env.HAS_KEYSTORE == 'true'
         run: echo "$KEYSTORE_B64" | tr -d ' \n\r' | base64 -d > ytdl.p12
 
       - name: Build debug APK
-        env:
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
         run: gradle assembleDebug --no-daemon --stacktrace
 
       - name: Upload APK
