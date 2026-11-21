@@ -5,10 +5,6 @@ import android.app.AlertDialog
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager
-import android.graphics.Color
-import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
@@ -46,7 +42,7 @@ class MainActivity : Activity() {
     }
 
     private lateinit var webView: WebView
-    private lateinit var overlay: LinearLayout
+    private lateinit var loadingUi: LinearLayout
     private lateinit var statusText: TextView
     private lateinit var retryBtn: Button
     private lateinit var spinner: ProgressBar
@@ -93,8 +89,8 @@ class MainActivity : Activity() {
                 override fun onPageFinished(view: WebView?, url: String?) {
                     super.onPageFinished(view, url)
                     pageShown = true
-                    webView.visibility = View.VISIBLE
-                    overlay.visibility = View.GONE
+                    this@MainActivity.webView.visibility = View.VISIBLE
+                    loadingUi.visibility = View.GONE
                 }
             }
             webChromeClient = buildChromeClient()
@@ -107,7 +103,7 @@ class MainActivity : Activity() {
             )
         )
 
-        overlay = LinearLayout(this).apply {
+        loadingUi = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
             setBackgroundColor(BG)
@@ -127,11 +123,11 @@ class MainActivity : Activity() {
             visibility = View.GONE
             setOnClickListener { boot() }
         }
-        overlay.addView(spinner)
-        overlay.addView(statusText)
-        overlay.addView(retryBtn)
+        loadingUi.addView(spinner)
+        loadingUi.addView(statusText)
+        loadingUi.addView(retryBtn)
         root.addView(
-            overlay,
+            loadingUi,
             FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
@@ -204,7 +200,7 @@ class MainActivity : Activity() {
             booting = true
         }
         ui.post {
-            overlay.visibility = View.VISIBLE
+            loadingUi.visibility = View.VISIBLE
             spinner.visibility = View.VISIBLE
             retryBtn.visibility = View.GONE
             statusText.text = getString(R.string.starting)
@@ -228,7 +224,7 @@ class MainActivity : Activity() {
             val up = ok
             ui.post {
                 if (up) {
-                    overlay.visibility = View.GONE
+                    loadingUi.visibility = View.GONE
                     webView.visibility = View.VISIBLE
                     if (!pageShown || webView.url == null) {
                         webView.loadUrl("$BASE/?v=1")
@@ -237,7 +233,7 @@ class MainActivity : Activity() {
                     spinner.visibility = View.GONE
                     retryBtn.visibility = View.VISIBLE
                     statusText.text = getString(R.string.start_failed)
-                    overlay.visibility = View.VISIBLE
+                    loadingUi.visibility = View.VISIBLE
                 }
             }
         }.start()
