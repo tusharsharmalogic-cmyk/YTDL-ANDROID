@@ -9,6 +9,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.text.InputType
+import android.util.Log
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -28,20 +29,36 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * Thin shell around the Flask UI that already runs in Termux on 127.0.0.1:5000.
- * Nothing of the web app is bundled here: the WebView always loads the live server.
+ * Thin shell around the Flask UI that runs in Termux on 127.0.0.1:5000.
+ *
+ * Startup contract:
+ *  - Probe /api/health first. If it responds, the server is already up (the
+ *    user brought the app back to the foreground after a previous session,
+ *    or Termux is still running it) and we go straight to the WebView.
+ *  - Otherwise ask Termux to run start_ytdl.sh and poll /api/health until it
+ *    responds or the boot budget (~60s) runs out.
+ *  - The whole boot is wrapped in try/finally so the UI always ends in a
+ *    usable state, even if the thread dies mid-way. Previously an exception
+ *    inside the boot thread left `booting=true` forever, freezing the
+ *    "Starting YTDL server…" screen with no retry button.
+ *  - The Termux permission dialog is awaited before boot(), so we never race
+ *    startTermuxServer() against a permission that has not been granted yet.
  */
 class MainActivity : Activity() {
 
     private companion object {
+        const val TAG = "YTDL"
         const val BASE = "http://127.0.0.1:5000"
         const val START_SCRIPT = "/data/data/com.termux/files/home/start_ytdl.sh"
         const val BG = 0xFF0F1115.toInt()
         const val FG = 0xFFE8EAF0.toInt()
         const val ACC = 0xFFFF4D4D.toInt()
         const val REQ_TERMUX = 1001
-        const val POLL_TRIES = 50
+        // 120 * 500ms = 60s — Termux + Python cold start can easily take 20-40s.
+        const val POLL_TRIES = 120
         const val POLL_MS = 500L
+        // Extra pause so Termux has actually spawned the process before we probe.
+        const val TERMUX_WARMUP_MS = 1200L
     }
 
     private lateinit var webView: WebView
@@ -62,15 +79,20 @@ class MainActivity : Activity() {
             WebView.setWebContentsDebuggingEnabled(true)
         }
 
-        if (checkSelfPermission("com.termux.permission.RUN_COMMAND") != PackageManager.PERMISSION_GRANTED) {
+        val granted = checkSelfPermission("com.termux.permission.RUN_COMMAND") ==
+                PackageManager.PERMISSION_GRANTED
+        if (!granted) {
             try {
                 requestPermissions(arrayOf("com.termux.permission.RUN_COMMAND"), REQ_TERMUX)
             } catch (e: Exception) {
-                // Termux not installed: the retry message explains what to install.
+                // Termux is not installed, or the permission is unknown.
+                // Boot anyway — the loading screen will surface the message.
+                Log.w(TAG, "requestPermissions failed", e)
+                boot()
             }
+        } else {
+            boot()
         }
-
-        boot()
     }
 
     // ---------------------------------------------------------------- UI
@@ -94,6 +116,16 @@ class MainActivity : Activity() {
                     pageShown = true
                     this@MainActivity.webView.visibility = View.VISIBLE
                     loadingUi.visibility = View.GONE
+                }
+
+                override fun onReceivedError(
+                    view: WebView?,
+                    errorCode: Int,
+                    description: String?,
+                    failingUrl: String?
+                ) {
+                    super.onReceivedError(view, errorCode, description, failingUrl)
+                    Log.w(TAG, "WebView error $errorCode: $description ($failingUrl)")
                 }
             }
             webChromeClient = buildChromeClient()
@@ -124,7 +156,10 @@ class MainActivity : Activity() {
             text = getString(R.string.retry)
             setTextColor(ACC)
             visibility = View.GONE
-            setOnClickListener { boot() }
+            setOnClickListener {
+                Log.i(TAG, "retry tapped")
+                boot()
+            }
         }
         loadingUi.addView(spinner)
         loadingUi.addView(statusText)
@@ -197,49 +232,97 @@ class MainActivity : Activity() {
 
     // ------------------------------------------------------------ boot flow
 
+    override fun onRequestPermissionsResult(
+        requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+    ) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == REQ_TERMUX) {
+            val granted = grantResults.isNotEmpty() &&
+                    grantResults[0] == PackageManager.PERMISSION_GRANTED
+            Log.i(TAG, "RUN_COMMAND permission granted=$granted")
+            // Boot now that the permission state is settled. If the user
+            // denied, the loading screen will explain what to fix and Retry
+            // stays available.
+            boot()
+        }
+    }
+
     private fun boot() {
         synchronized(bootLock) {
-            if (booting) return
+            if (booting) {
+                Log.d(TAG, "boot ignored: already booting")
+                return
+            }
             booting = true
         }
+        Log.i(TAG, "boot: probing /api/health")
+
         ui.post {
             loadingUi.visibility = View.VISIBLE
             spinner.visibility = View.VISIBLE
             retryBtn.visibility = View.GONE
             statusText.text = getString(R.string.starting)
+            if (!pageShown) {
+                webView.visibility = View.GONE
+            }
         }
 
         Thread {
-            var ok = health()
-            if (!ok) {
-                startTermuxServer()
-                var i = 0
-                while (i < POLL_TRIES) {
-                    Thread.sleep(POLL_MS)
-                    if (health()) {
-                        ok = true
-                        break
+            var up = false
+            try {
+                up = health()
+                Log.d(TAG, "initial health=$up")
+                if (!up) {
+                    startTermuxServer()
+                    // Give Termux a moment to actually spawn the process.
+                    sleepQuietly(TERMUX_WARMUP_MS)
+                    var i = 0
+                    while (i < POLL_TRIES) {
+                        if (health()) {
+                            up = true
+                            Log.d(TAG, "health up after ${i * POLL_MS}ms")
+                            break
+                        }
+                        sleepQuietly(POLL_MS)
+                        i++
                     }
-                    i++
                 }
-            }
-            synchronized(bootLock) { booting = false }
-            val up = ok
-            ui.post {
-                if (up) {
-                    loadingUi.visibility = View.GONE
-                    webView.visibility = View.VISIBLE
-                    if (!pageShown || webView.url == null) {
-                        webView.loadUrl("$BASE/?v=1")
-                    }
-                } else {
-                    spinner.visibility = View.GONE
-                    retryBtn.visibility = View.VISIBLE
-                    statusText.text = getString(R.string.start_failed)
-                    loadingUi.visibility = View.VISIBLE
-                }
+            } catch (t: Throwable) {
+                // Any unexpected throwable (Interrupted, OOM, IllegalState…)
+                // must not leave the UI frozen on the "Starting" overlay.
+                Log.e(TAG, "boot failed", t)
+                up = false
+            } finally {
+                synchronized(bootLock) { booting = false }
+                val finalUp = up
+                ui.post { onBootResult(finalUp) }
             }
         }.start()
+    }
+
+    private fun onBootResult(up: Boolean) {
+        Log.i(TAG, "onBootResult up=$up pageShown=$pageShown")
+        if (up) {
+            spinner.visibility = View.GONE
+            retryBtn.visibility = View.GONE
+            loadingUi.visibility = View.GONE
+            webView.visibility = View.VISIBLE
+            if (!pageShown || webView.url == null) {
+                webView.loadUrl("$BASE/?v=1")
+            }
+        } else {
+            spinner.visibility = View.GONE
+            retryBtn.visibility = View.VISIBLE
+            statusText.text = getString(R.string.start_failed)
+            loadingUi.visibility = View.VISIBLE
+        }
+    }
+
+    private fun sleepQuietly(ms: Long) {
+        try {
+            Thread.sleep(ms)
+        } catch (_: InterruptedException) {
+        }
     }
 
     private fun health(): Boolean {
@@ -257,6 +340,7 @@ class MainActivity : Activity() {
     }
 
     private fun startTermuxServer() {
+        Log.i(TAG, "startTermuxServer: $START_SCRIPT")
         val i = Intent("com.termux.RUN_COMMAND").apply {
             setClassName("com.termux", "com.termux.app.RunCommandService")
             putExtra("com.termux.RUN_COMMAND_PATH", "/data/data/com.termux/files/usr/bin/bash")
@@ -267,8 +351,10 @@ class MainActivity : Activity() {
         try {
             startService(i)
         } catch (e: Exception) {
+            Log.w(TAG, "startService(RUN_COMMAND) failed", e)
             ui.post {
                 statusText.text = getString(R.string.termux_missing)
+                spinner.visibility = View.GONE
                 retryBtn.visibility = View.VISIBLE
             }
         }
@@ -277,6 +363,7 @@ class MainActivity : Activity() {
     inner class Bridge {
         @JavascriptInterface
         fun ensureServer() {
+            Log.d(TAG, "JS requested ensureServer")
             Thread {
                 if (!health()) startTermuxServer()
             }.start()
@@ -287,9 +374,15 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        // If the server died since we were last visible (e.g. the idle
+        // watchdog fired while nothing was downloading), bring it back so
+        // the user sees a live UI rather than a blank page.
         if (pageShown) {
             Thread {
-                if (!health()) startTermuxServer()
+                if (!health()) {
+                    Log.i(TAG, "onResume: server down, re-booting")
+                    ui.post { boot() }
+                }
             }.start()
         }
     }
@@ -299,7 +392,7 @@ class MainActivity : Activity() {
         if (this::webView.isInitialized && webView.canGoBack()) {
             webView.goBack()
         } else {
-            // Downloads keep running inside Termux.
+            // Downloads keep running inside Termux; do not kill them.
             moveTaskToBack(true)
         }
     }

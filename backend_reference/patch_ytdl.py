@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Adds the Android-app support to an existing ytdl.py, without touching anything else.
+Adds Android-app support to an existing ytdl.py, without touching anything else.
 
 Usage (on the phone, in Termux):
     python patch_ytdl.py /data/data/com.termux/files/home/ytdl.py
 
-Backend changes:
-  * /api/health route
-  * request/idle counters + watchdog that exits only when nothing is downloading
-  * --no-browser and --idle-shutdown flags (plain `python ytdl.py` behaves as before)
+The script is idempotent and layered:
 
-Frontend changes (inside INDEX_HTML, only active when window.Android exists):
-  * fetch wrapper that re-starts the server through the APK bridge
-  * job id saved in localStorage so a running download can be resumed
+  v1: /api/health, request/idle counters, an idle watchdog that never exits
+      while a download is running, --no-browser / --idle-shutdown CLI flags,
+      a JS fetch wrapper that revives the server via the APK bridge, and
+      per-job resume on page reload (single-job UI).
 
-The script is idempotent: running it twice changes nothing. It refuses to write
-anything and lists the anchors it could not find if the file does not match.
+  v2: persistent job state (~/.ytdl_jobs.json, snapshotted every 2s), a new
+      /api/jobs endpoint that returns the full active + history list, and a
+      frontend bootstrap that syncs the download list from the server on
+      reconnect instead of relying on localStorage alone. Multiple active
+      jobs are preserved; the UI resumes the newest one and leaves the
+      others running on the server untouched.
+
+Both layers are skipped if their MARK is already present. If a new layer is
+added but its anchors are not found in the target file, nothing is written
+for that layer and the missing anchors are listed.
 """
 
 import ast
@@ -26,12 +32,14 @@ import sys
 import time
 
 MARK = "ANDROID-APP PATCH"
+MARK_V2 = "ANDROID-APP PATCH v2"
+
+# --------------------------------------------------------------------------- v1
 
 IDLE_BLOCK = '''
 # ---- {mark}: health route + request counters ----
 _IDLE = {{"last": time.time(), "active": 0}}
 _IDLE_LOCK = threading.Lock()
-
 
 @app.before_request
 def _req_start():
@@ -39,13 +47,11 @@ def _req_start():
         _IDLE["last"] = time.time()
         _IDLE["active"] += 1
 
-
 @app.teardown_request
 def _req_end(exc=None):
     with _IDLE_LOCK:
         _IDLE["active"] = max(0, _IDLE["active"] - 1)
         _IDLE["last"] = time.time()
-
 
 @app.route("/api/health")
 def api_health():
@@ -64,7 +70,6 @@ def _watchdog(timeout):
             busy = _IDLE["active"] > 0
         if not busy and not running and idle > timeout:
             os._exit(0)
-
 
 '''.format(mark=MARK)
 
@@ -103,7 +108,7 @@ FETCH_WRAPPER = '''// ---- {mark}: restart the server through the APK bridge whe
 
 RESUME_BLOCK = '''try {{
   const j = localStorage.getItem('ytdl_job');
-  if (j) {{ jobId = j; $(\"btnStart\").disabled = true; $(\"btnStop\").disabled = false;
+  if (j) {{ jobId = j; $("btnStart").disabled = true; $("btnStop").disabled = false;
            timer = setInterval(poll, 1000); poll(); }}
 }} catch (e) {{}}
 
@@ -121,22 +126,137 @@ MAIN_NEW = '''    ap = argparse.ArgumentParser()
     if args.idle_shutdown:
         threading.Thread(target=_watchdog, args=(args.idle_shutdown,), daemon=True).start()'''
 
+# --------------------------------------------------------------------------- v2
 
-def apply(src, old, new, label, missing):
-    if old in src:
-        return src.replace(old, new, 1)
+V2_STATE_BLOCK = '''
+# ---- {mark}: persistent job state + /api/jobs ----
+import json as _v2_json
+_V2_STATE_FILE = os.path.expanduser("~/.ytdl_jobs.json")
+_V2_STATE_LOCK = threading.Lock()
+
+def _v2_safe(v):
+    if isinstance(v, (str, int, float, bool, type(None))):
+        return v
+    if isinstance(v, (list, dict)):
+        try:
+            _v2_json.dumps(v)
+            return v
+        except (TypeError, ValueError):
+            return None
+    return None
+
+def _v2_job_to_dict(j):
+    try:
+        d = {{}}
+        for k, v in vars(j).items():
+            if k.startswith("_"):
+                continue
+            sv = _v2_safe(v)
+            if sv is not None or v is None:
+                d[k] = sv
+        return d
+    except Exception:
+        return {{}}
+
+def _v2_load_state():
+    try:
+        with open(_V2_STATE_FILE, "r") as f:
+            return _v2_json.load(f)
+    except (FileNotFoundError, ValueError, OSError):
+        return {{}}
+
+def _v2_save_state():
+    try:
+        with _V2_STATE_LOCK:
+            snap = {{}}
+            for jid, j in list(JOBS.items()):
+                snap[str(jid)] = _v2_job_to_dict(j)
+            tmp = _V2_STATE_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                _v2_json.dump(snap, f)
+            os.replace(tmp, _V2_STATE_FILE)
+    except Exception:
+        pass
+
+def _v2_persist_loop():
+    while True:
+        time.sleep(2)
+        _v2_save_state()
+
+@app.route("/api/jobs")
+def api_jobs():
+    out = []
+    for jid, j in list(JOBS.items()):
+        d = _v2_job_to_dict(j)
+        d["id"] = str(jid)
+        out.append(d)
+    return jsonify(out)
+
+def _v2_restore_missing():
+    # Re-seed JOBS from disk for entries lost by a server crash.
+    # A job that was still running when the server died cannot be resumed
+    # (its yt-dlp subprocess died with the server). It is surfaced as an
+    # error so the UI shows it in history instead of pretending it is live.
+    saved = _v2_load_state()
+    for jid, rec in saved.items():
+        if jid in JOBS:
+            continue
+        if isinstance(rec, dict) and not rec.get("finished") and not rec.get("error"):
+            rec = dict(rec)
+            rec["error"] = "interrupted by server restart"
+        # Best-effort placeholder so history survives a restart.
+        try:
+            class _Ghost:
+                def __init__(self, d):
+                    self.__dict__.update(d)
+                    self.finished = True
+            JOBS[jid] = _Ghost(rec)
+        except Exception:
+            pass
+
+_v2_restore_missing()
+threading.Thread(target=_v2_persist_loop, daemon=True).start()
+'''.format(mark=MARK_V2)
+
+RESUME_BLOCK_V2 = '''// ---- {mark}: restore the full download list from the server on reconnect ----
+(async function restoreJobs() {{
+  try {{
+    const r = await fetch('/api/jobs', {{ cache: 'no-store' }});
+    if (!r.ok) return;
+    const jobs = await r.json();
+    if (!Array.isArray(jobs) || jobs.length === 0) return;
+    const active = jobs.filter(j => !j.finished && !j.error);
+    if (active.length > 0) {{
+      const pick = active[active.length - 1];
+      jobId = pick.id;
+      try {{ localStorage.setItem('ytdl_job', jobId); }} catch (e) {{}}
+      $("btnStart").disabled = true;
+      $("btnStop").disabled = false;
+      timer = setInterval(poll, 1000);
+      poll();
+    }} else {{
+      try {{ localStorage.removeItem('ytdl_job'); }} catch (e) {{}}
+    }}
+  }} catch (e) {{}}
+}})();
+
+'''.format(mark=MARK_V2)
+
+# --------------------------------------------------------------------------- apply
+
+
+def _replace_once(text, old, new, label, missing, changed):
+    if old in text:
+        return text.replace(old, new, 1)
     missing.append(label)
-    return src
+    return text
 
 
-def patch(text):
-    missing = []
+def apply_v1(text):
+    """Apply the v1 layer. Returns (text, changed, missing)."""
     changed = []
+    missing = []
 
-    if MARK in text:
-        return text, changed, missing
-
-    # 1. argparse
     if "import argparse" not in text:
         old = "import webbrowser\n"
         new = "import webbrowser\nimport argparse  # " + MARK + "\n"
@@ -146,7 +266,6 @@ def patch(text):
         else:
             missing.append("import webbrowser")
 
-    # 2. health route + idle counters
     old = "app = Flask(__name__)\n"
     if old in text and "_IDLE_LOCK" not in text:
         text = text.replace(old, old + IDLE_BLOCK, 1)
@@ -154,7 +273,6 @@ def patch(text):
     elif "_IDLE_LOCK" not in text:
         missing.append("app = Flask(__name__)")
 
-    # 3. watchdog (needs JOBS, so it goes right before run_cmd)
     old = "def run_cmd(job, cmd):"
     if old in text and "_watchdog" not in text:
         text = text.replace(old, WATCHDOG_BLOCK + old, 1)
@@ -162,14 +280,12 @@ def patch(text):
     elif "_watchdog" not in text:
         missing.append("def run_cmd(job, cmd):")
 
-    # 4. CLI flags in __main__
     if "--idle-shutdown" not in text:
         before = text
-        text = apply(text, MAIN_OLD, MAIN_NEW, "cli flags", missing)
+        text = _replace_once(text, MAIN_OLD, MAIN_NEW, "cli flags", missing, changed)
         if text != before:
             changed.append("--no-browser / --idle-shutdown")
 
-    # 5. JS fetch wrapper (top of the <script> block)
     old = "const $ = id => document.getElementById(id);"
     if old in text and "window.Android.ensureServer" not in text:
         text = text.replace(old, FETCH_WRAPPER + old, 1)
@@ -177,7 +293,6 @@ def patch(text):
     elif "window.Android.ensureServer" not in text:
         missing.append("const $ = id => document.getElementById(id);")
 
-    # 6. remember the job id
     old = "  jobId = r.id;\n"
     if old in text and "localStorage.setItem('ytdl_job'" not in text:
         text = text.replace(
@@ -187,38 +302,86 @@ def patch(text):
         )
         changed.append("save job id")
 
-    # 7. clear it when the job errored or finished
     old = "  if (r.error) { clearInterval(timer); return; }"
     if old in text:
-        text = text.replace(
-            old,
+        new = (
             "  if (r.error) {\n"
             "    clearInterval(timer);\n"
             "    try { localStorage.removeItem('ytdl_job'); } catch (e) {}\n"
             "    $(\"btnStart\").disabled = false; $(\"btnStop\").disabled = true;\n"
             "    return;\n"
-            "  }",
-            1,
+            "  }"
         )
-        changed.append("clear job id on error")
+        if old in text and new not in text:
+            text = text.replace(old, new, 1)
+            changed.append("clear job id on error")
 
     old = "  if (r.finished) {\n    clearInterval(timer);"
     if old in text:
-        text = text.replace(
-            old,
+        new = (
             "  if (r.finished) {\n    clearInterval(timer);\n"
-            "    try { localStorage.removeItem('ytdl_job'); } catch (e) {}",
-            1,
+            "    try { localStorage.removeItem('ytdl_job'); } catch (e) {}"
         )
-        changed.append("clear job id on finish")
+        if new not in text:
+            text = text.replace(old, new, 1)
+            changed.append("clear job id on finish")
 
-    # 8. resume a job a previous session left running
     old = "loadSaved();\nrefresh();"
     if old in text and "localStorage.getItem('ytdl_job')" not in text:
         idx = text.rfind(old)
         if idx >= 0:
             text = text[:idx] + RESUME_BLOCK + text[idx:]
             changed.append("resume running job")
+
+    return text, changed, missing
+
+
+def apply_v2(text):
+    """Apply the v2 layer. Returns (text, changed, missing)."""
+    changed = []
+    missing = []
+
+    # 1. backend: state block goes right after v1's idle lock definition.
+    anchor = "_IDLE_LOCK = threading.Lock()\n"
+    if anchor in text and "_v2_persist_loop" not in text:
+        text = text.replace(anchor, anchor + V2_STATE_BLOCK, 1)
+        changed.append("persistent state + /api/jobs")
+    elif "_v2_persist_loop" not in text:
+        missing.append(anchor.strip())
+
+    # 2. frontend: swap the single-job resume for a list-aware one.
+    if "restoreJobs()" not in text and RESUME_BLOCK in text:
+        text = text.replace(RESUME_BLOCK, RESUME_BLOCK_V2, 1)
+        changed.append("restore list from /api/jobs")
+    elif "restoreJobs()" not in text and RESUME_BLOCK not in text:
+        # v1 was not applied here — v2 needs its frontend hooks, skip cleanly.
+        missing.append("v1 resume block")
+
+    return text, changed, missing
+
+
+def patch(text):
+    changed = []
+    missing = []
+
+    if MARK not in text:
+        text, c, m = apply_v1(text)
+        if m:
+            return text, changed, missing + ["v1: " + x for x in m]
+        changed.extend(c)
+    else:
+        # v1 markers already present, but its frontend hooks may be missing
+        # on a partially-patched file. Re-run the frontend-only sub-steps.
+        for old, label in [
+            ("  jobId = r.id;\n", "save job id"),
+        ]:
+            pass  # no-op: v1 hooks are considered settled once MARK is present.
+
+    if MARK_V2 not in text:
+        text, c, m = apply_v2(text)
+        if m:
+            return text, changed, missing + ["v2: " + x for x in m]
+        changed.extend(c)
 
     return text, changed, missing
 
@@ -235,8 +398,8 @@ def main():
     with open(path, "r", encoding="utf-8") as f:
         original = f.read()
 
-    if MARK in original:
-        print("already patched, nothing to do.")
+    if MARK in original and MARK_V2 in original:
+        print("already fully patched (v1 + v2), nothing to do.")
         return 0
 
     new_text, changed, missing = patch(original)
@@ -246,6 +409,10 @@ def main():
         for m in missing:
             print("  - " + m)
         return 1
+
+    if not changed:
+        print("no changes applied (target already up to date).")
+        return 0
 
     try:
         ast.parse(new_text)

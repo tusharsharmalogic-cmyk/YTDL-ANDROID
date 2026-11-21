@@ -5,12 +5,14 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
+    name: Build signed APK
     runs-on: ubuntu-latest
     env:
-      KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
-      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
       HAS_KEYSTORE: ${{ secrets.KEYSTORE_B64 != '' }}
     steps:
       - name: Checkout
@@ -27,12 +29,42 @@ jobs:
         with:
           gradle-version: '8.5'
 
-      - name: Decode keystore
-        if: env.HAS_KEYSTORE == 'true'
-        run: echo "$KEYSTORE_B64" | tr -d ' \n\r' | base64 -d > ytdl.p12
+      # The keystore is never committed. It is stored as a base64 string in the
+      # repository secret KEYSTORE_B64. The password is in KEYSTORE_PASSWORD.
+      # If neither is set the build still succeeds (unsigned debug APK), so
+      # forks work out of the box.
+      - name: Decode keystore from KEYSTORE_B64
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_B64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${KEYSTORE_B64:-}" ]; then
+            echo "KEYSTORE_B64 secret is not set — building without a fixed signature."
+            exit 0
+          fi
+          echo "$KEYSTORE_B64" | tr -d ' \t\r\n' | base64 -d > ytdl.p12
+          if [ ! -s ytdl.p12 ]; then
+            echo "Decoded keystore is empty — check KEYSTORE_B64." >&2
+            exit 1
+          fi
+          echo "Decoded $(wc -c < ytdl.p12) bytes into ytdl.p12"
 
       - name: Build debug APK
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
         run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Verify APK signature (if signed)
+        if: ${{ env.HAS_KEYSTORE == 'true' }}
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          if [ ! -f "$APK" ]; then
+            echo "APK not produced at $APK" >&2
+            exit 1
+          fi
+          BT=$(ls $ANDROID_HOME/build-tools | sort -V | tail -1)
+          "$ANDROID_HOME/build-tools/$BT/apksigner" verify --print-certs "$APK"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
