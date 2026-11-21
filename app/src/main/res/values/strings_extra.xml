@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="starting">Starting YTDL server…</string>
+    <string name="retry">Retry</string>
+    <string name="start_failed">Server did not start.\n\nOpen Termux once, make sure allow-external-apps = true is set in ~/.termux/termux.properties, and allow the Termux permission for YTDL, then tap Retry.</string>
+    <string name="termux_missing">Termux is not installed (or is blocking the command). Install Termux from F-Droid, open it once, then tap Retry.</string>
+</resources>
