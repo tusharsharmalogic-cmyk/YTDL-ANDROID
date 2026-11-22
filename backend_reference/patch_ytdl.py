@@ -213,10 +213,13 @@ def _v2_restore_missing():
             JOBS[jid] = _Ghost(rec)
         except Exception:
             pass
-
-_v2_restore_missing()
-threading.Thread(target=_v2_persist_loop, daemon=True).start()
 '''.format(mark=MARK_V2)
+
+# JOBS is defined later in ytdl.py than the idle lock, so the startup calls
+# must go right after "JOBS = {}" instead of inside the state block.
+V2_START_BLOCK = '''_v2_restore_missing()  # ANDROID-APP PATCH v2
+threading.Thread(target=_v2_persist_loop, daemon=True).start()
+'''
 
 RESUME_BLOCK_V2 = '''// ---- {mark}: restore the full download list from the server on reconnect ----
 (async function restoreJobs() {{
@@ -345,7 +348,12 @@ def apply_v2(text):
     anchor = "_IDLE_LOCK = threading.Lock()\n"
     if anchor in text and "_v2_persist_loop" not in text:
         text = text.replace(anchor, anchor + V2_STATE_BLOCK, 1)
-        changed.append("persistent state + /api/jobs")
+        jobs_anchor = "JOBS = {}\n"
+        if jobs_anchor in text:
+            text = text.replace(jobs_anchor, jobs_anchor + V2_START_BLOCK, 1)
+            changed.append("persistent state + /api/jobs")
+        else:
+            missing.append(jobs_anchor.strip())
     elif "_v2_persist_loop" not in text:
         missing.append(anchor.strip())
 
