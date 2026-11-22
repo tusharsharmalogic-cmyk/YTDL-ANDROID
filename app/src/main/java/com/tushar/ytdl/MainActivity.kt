@@ -356,7 +356,7 @@ class MainActivity : Activity() {
             val cmd = "cd $home || exit 1; " +
                 "echo '$b64' | base64 -d | gzip -dc > ytdl.py.tmp && mv ytdl.py.tmp ytdl.py || exit 1; " +
                 "termux-wake-lock 2>/dev/null; " +
-                "nohup python $home/ytdl.py --no-browser --idle-shutdown 300 > $home/ytdl_server.log 2>&1 & " +
+                "nohup python $home/ytdl.py --no-browser --idle-shutdown 30 > $home/ytdl_server.log 2>&1 & " +
                 "( while pgrep -f $home/ytdl.py >/dev/null; do sleep 5; done; termux-wake-unlock ) >/dev/null 2>&1 &"
             Log.i(TAG, "bundled ytdl.py: ${raw.size} bytes, command ${cmd.length} chars")
             arrayOf("-c", cmd)
@@ -399,8 +399,25 @@ class MainActivity : Activity() {
 
     // ------------------------------------------------------------ lifecycle
 
+    // While the app is on screen, ping /api/health every 10s so the server's
+    // idle timer stays fresh. When the app leaves the foreground the pings
+    // stop and the server shuts itself down after the idle timeout (30s).
+    private val heartbeat = object : Runnable {
+        override fun run() {
+            Thread { health() }.start()
+            ui.postDelayed(this, 10_000L)
+        }
+    }
+
+    override fun onPause() {
+        ui.removeCallbacks(heartbeat)
+        super.onPause()
+    }
+
     override fun onResume() {
         super.onResume()
+        ui.removeCallbacks(heartbeat)
+        ui.post(heartbeat)
         // If the server died since we were last visible (e.g. the idle
         // watchdog fired while nothing was downloading), bring it back so
         // the user sees a live UI rather than a blank page.
