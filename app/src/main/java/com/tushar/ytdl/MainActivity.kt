@@ -339,12 +339,39 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * Builds a one-shot bash command that unpacks the bundled (already patched)
+     * ytdl.py from the APK assets into Termux's home and starts the server.
+     * The file travels inside the intent as gzip+base64, so no script has to be
+     * copied into Termux by hand. Falls back to ~/start_ytdl.sh if the asset
+     * cannot be read.
+     */
+    private fun buildBootCommand(): Array<String> {
+        return try {
+            val raw = assets.open("ytdl.py").use { it.readBytes() }
+            val bos = java.io.ByteArrayOutputStream()
+            java.util.zip.GZIPOutputStream(bos).use { it.write(raw) }
+            val b64 = android.util.Base64.encodeToString(bos.toByteArray(), android.util.Base64.NO_WRAP)
+            val home = "/data/data/com.termux/files/home"
+            val cmd = "cd $home || exit 1; " +
+                "echo '$b64' | base64 -d | gzip -dc > ytdl.py.tmp && mv ytdl.py.tmp ytdl.py || exit 1; " +
+                "termux-wake-lock 2>/dev/null; " +
+                "nohup python $home/ytdl.py --no-browser --idle-shutdown 300 > $home/ytdl_server.log 2>&1 & " +
+                "( while pgrep -f $home/ytdl.py >/dev/null; do sleep 5; done; termux-wake-unlock ) >/dev/null 2>&1 &"
+            Log.i(TAG, "bundled ytdl.py: ${raw.size} bytes, command ${cmd.length} chars")
+            arrayOf("-c", cmd)
+        } catch (e: Exception) {
+            Log.w(TAG, "asset ytdl.py unavailable, falling back to $START_SCRIPT", e)
+            arrayOf(START_SCRIPT)
+        }
+    }
+
     private fun startTermuxServer() {
-        Log.i(TAG, "startTermuxServer: $START_SCRIPT")
+        Log.i(TAG, "startTermuxServer: bundled backend")
         val i = Intent("com.termux.RUN_COMMAND").apply {
             setClassName("com.termux", "com.termux.app.RunCommandService")
             putExtra("com.termux.RUN_COMMAND_PATH", "/data/data/com.termux/files/usr/bin/bash")
-            putExtra("com.termux.RUN_COMMAND_ARGUMENTS", arrayOf(START_SCRIPT))
+            putExtra("com.termux.RUN_COMMAND_ARGUMENTS", buildBootCommand())
             putExtra("com.termux.RUN_COMMAND_WORKDIR", "/data/data/com.termux/files/home")
             putExtra("com.termux.RUN_COMMAND_BACKGROUND", true)
         }

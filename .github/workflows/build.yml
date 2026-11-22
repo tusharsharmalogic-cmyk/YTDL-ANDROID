@@ -24,6 +24,18 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      # The app bundles the patched backend as an asset and pushes it into
+      # Termux itself, so the user never copies ytdl.py or start_ytdl.sh by hand.
+      - name: Build patched backend asset
+        run: |
+          set -euo pipefail
+          mkdir -p app/src/main/assets
+          cp backend_reference/ytdl.py app/src/main/assets/ytdl.py
+          python3 backend_reference/patch_ytdl.py app/src/main/assets/ytdl.py
+          rm -f app/src/main/assets/ytdl.py.bak-*
+          python3 -c "import ast;ast.parse(open('app/src/main/assets/ytdl.py').read())"
+          ls -la app/src/main/assets
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v3
         with:
