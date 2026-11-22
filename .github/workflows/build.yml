@@ -49,6 +49,22 @@ jobs:
           fi
           echo "Decoded $(wc -c < ytdl.p12) bytes into ytdl.p12"
 
+      - name: Detect keystore alias
+        if: ${{ env.HAS_KEYSTORE == 'true' }}
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          PASS=$(printf '%s' "$KEYSTORE_PASSWORD" | tr -d '\r\n')
+          keytool -list -keystore ytdl.p12 -storetype PKCS12 -storepass "$PASS" | tee /tmp/ks_list.txt
+          ALIAS=$(grep 'PrivateKeyEntry' /tmp/ks_list.txt | head -1 | cut -d, -f1 | tr -d '\r\n')
+          if [ -z "$ALIAS" ]; then
+            echo "No PrivateKeyEntry found in keystore." >&2
+            exit 1
+          fi
+          echo "Using alias: $ALIAS"
+          echo "KEYSTORE_ALIAS=$ALIAS" >> "$GITHUB_ENV"
+
       - name: Build debug APK
         env:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}

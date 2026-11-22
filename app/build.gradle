@@ -24,7 +24,7 @@ android {
     signingConfigs {
         ytdl {
             storeType 'pkcs12'
-            keyAlias 'ytdl'
+            keyAlias (System.getenv('KEYSTORE_ALIAS') ?: 'ytdl')
             storeFile keystoreFile
             storePassword keystorePass
             keyPassword keystorePass
