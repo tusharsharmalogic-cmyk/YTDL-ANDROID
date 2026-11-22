@@ -6,7 +6,7 @@ plugins {
 // Fixed signing key (optional). The keystore is never committed: CI decodes it
 // from the KEYSTORE_B64 secret into <repo>/ytdl.p12 and passes KEYSTORE_PASSWORD.
 def keystoreFile = rootProject.file('ytdl.p12')
-def keystorePass = (System.getenv('KEYSTORE_PASSWORD') ?: '').replaceAll(/[^0-9a-fA-F]/, '')
+def keystorePass = (System.getenv('KEYSTORE_PASSWORD') ?: '').replaceAll(/[\r\n]+$/, '').trim()
 def hasKeystore = keystoreFile.exists() && keystorePass.length() > 0
 
 android {
