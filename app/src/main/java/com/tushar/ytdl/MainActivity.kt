@@ -357,7 +357,7 @@ class MainActivity : Activity() {
                 "echo '$b64' | base64 -d | gzip -dc > ytdl.py.tmp && mv ytdl.py.tmp ytdl.py || exit 1; " +
                 "termux-wake-lock 2>/dev/null; " +
                 "nohup python $home/ytdl.py --no-browser --idle-shutdown 30 > $home/ytdl_server.log 2>&1 & " +
-                "( while pgrep -f $home/ytdl.py >/dev/null; do sleep 5; done; termux-wake-unlock ) >/dev/null 2>&1 &"
+                "SRV=\$!; ( while kill -0 \$SRV 2>/dev/null; do sleep 2; done; termux-wake-unlock ) >/dev/null 2>&1 &"
             Log.i(TAG, "bundled ytdl.py: ${raw.size} bytes, command ${cmd.length} chars")
             arrayOf("-c", cmd)
         } catch (e: Exception) {
